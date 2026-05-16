@@ -1,0 +1,8 @@
+version: "3.9"
+
+services:
+  pqc-api:
+    build: .
+    container_name: pqc-api-demo
+    ports:
+      - "8000:8000"
