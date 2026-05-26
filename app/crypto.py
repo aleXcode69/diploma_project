@@ -34,13 +34,10 @@ class HybridCryptoService:
         client_classic_public_key = x25519.X25519PublicKey.from_public_bytes(
             bytes.fromhex(client_classic_public_key_hex)
         )
-
         pq_ciphertext, pq_shared_secret = ml_kem_768.encrypt(client_pq_public_key)
-
         server_classic_private = x25519.X25519PrivateKey.generate()
         server_classic_public = server_classic_private.public_key()
         classic_shared_secret = server_classic_private.exchange(client_classic_public_key)
-
         session_key = self._derive_session_key(pq_shared_secret, classic_shared_secret)
         session_id = str(uuid.uuid4())
         created_at = datetime.now(timezone.utc).isoformat()
@@ -52,12 +49,11 @@ class HybridCryptoService:
             kem_algorithm=self.kem_alg,
             key_fingerprint=key_fingerprint,
         )
-
+        # Персистентное хранение (Fernet + PostgreSQL) — SessionRepository.save_session в main.py
         server_classic_public_hex = server_classic_public.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         ).hex()
-
         return session_id, pq_ciphertext.hex(), server_classic_public_hex
 
     @staticmethod

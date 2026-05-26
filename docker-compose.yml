@@ -1,5 +1,5 @@
 services:
-  web:
+  api:
     build: .
     container_name: pqc-api-web
     restart: unless-stopped

@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import json
 
 import requests
 from pqcrypto.kem import ml_kem_768
@@ -7,6 +8,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
+
+from app.payload_crypto import decrypt_bytes, encrypt_bytes
 
 
 def derive_hybrid_key(pq_secret: bytes, classic_secret: bytes) -> bytes:
@@ -59,12 +62,31 @@ def run(base_url: str) -> None:
     client_session_key = derive_hybrid_key(pq_shared_secret, classic_shared_secret)
     print(f"    client_session_key (hex, first 16 bytes): {client_session_key.hex()[:32]}...")
 
-    print("[5/5] Запрос защищенных данных...")
-    protected = requests.get(f"{base_url}/api/protected/{session_id}", timeout=20)
+    print("[5/6] Запрос защищенных данных (X-Session-ID + AES-GCM)...")
+    protected = requests.get(
+        f"{base_url}/api/protected/{session_id}",
+        headers={"X-Session-ID": session_id},
+        timeout=20,
+    )
     protected.raise_for_status()
-    protected_data = protected.json()
+    protected_data = json.loads(decrypt_bytes(client_session_key, protected.content))
     print("    Ответ protected endpoint:", protected_data["message"])
     print("    proof:", protected_data["proof"])
+
+    print("[6/6] Отправка зашифрованного POST через CryptoMiddleware...")
+    encrypted_body = encrypt_bytes(
+        client_session_key,
+        json.dumps({"action": "verify_access", "client": "demo"}).encode("utf-8"),
+    )
+    submit = requests.post(
+        f"{base_url}/api/protected/submit",
+        headers={"X-Session-ID": session_id, "Content-Type": "application/json"},
+        data=encrypted_body,
+        timeout=20,
+    )
+    submit.raise_for_status()
+    submit_data = json.loads(decrypt_bytes(client_session_key, submit.content))
+    print("    Ответ submit:", submit_data["message"])
 
     print("\nГотово: в dashboard должны быть видны шаги handshake в реальном времени.")
 

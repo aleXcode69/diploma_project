@@ -1,15 +1,35 @@
 import asyncio
 import datetime as dt
+import logging
+from contextlib import asynccontextmanager
 from typing import List
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from app.crypto import HybridCryptoService
+from app.middleware import CryptoMiddleware
 from app.models import HandshakeRequest, HandshakeResponse, ProtectedResponse
+from app.session_repository import SessionRepository
 
-app = FastAPI(title="PQC Secure REST API Demo", version="1.0.0")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
 crypto_service = HybridCryptoService(kem_alg="ML-KEM-768")
+session_repository = SessionRepository()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await session_repository.initialize()
+    yield
+    await session_repository.close()
+
+
+app = FastAPI(title="PQC Secure REST API Demo", version="1.0.0", lifespan=lifespan)
+app.add_middleware(CryptoMiddleware, session_repository=session_repository)
 
 
 class LogHub:
@@ -233,10 +253,22 @@ async def handshake(payload: HandshakeRequest) -> HandshakeResponse:
             client_pq_public_key_hex=payload.pq_public_key,
             client_classic_public_key_hex=payload.classic_public_key,
         )
+        state = crypto_service.sessions[session_id]
+        await session_repository.save_session(
+            session_id=session_id,
+            raw_session_key=state.session_key,
+            fingerprint=state.key_fingerprint,
+            kem_algorithm=state.kem_algorithm,
+            created_at=state.created_at,
+        )
 
         await log_hub.broadcast(
             f"Handshake завершен. Сессия создана: {session_id}"
         )
+        if session_repository.db_enabled:
+            await log_hub.broadcast("Сессия сохранена в PostgreSQL (ключ зашифрован Fernet).")
+        else:
+            await log_hub.broadcast("Сессия сохранена (in-memory, ключ зашифрован Fernet).")
         await log_hub.broadcast("На сервере сформирован гибридный сессионный ключ.")
         return HandshakeResponse(
             session_id=session_id,
@@ -249,12 +281,16 @@ async def handshake(payload: HandshakeRequest) -> HandshakeResponse:
 
 
 @app.get("/api/protected/{session_id}", response_model=ProtectedResponse)
-async def protected_data(session_id: str) -> ProtectedResponse:
+async def protected_data(session_id: str, request: Request) -> ProtectedResponse:
     global protected_requests_total
+    header_session = getattr(request.state, "session_id", None)
+    if header_session and header_session != session_id:
+        raise HTTPException(status_code=401, detail="X-Session-ID не совпадает с идентификатором в URL")
     try:
         protected_requests_total += 1
         proof = crypto_service.get_proof(session_id)
         await log_hub.broadcast(f"Доступ к защищенному endpoint для сессии {session_id}.")
+        await log_hub.broadcast("CryptoMiddleware: ответ зашифрован (AES-GCM).")
         return ProtectedResponse(
             session_id=session_id,
             message="Доступ предоставлен: защищенные данные получены.",
@@ -264,9 +300,23 @@ async def protected_data(session_id: str) -> ProtectedResponse:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.post("/api/protected/submit")
+async def protected_submit(request: Request) -> dict:
+    decrypted = getattr(request.state, "decrypted_data", None)
+    if decrypted is None:
+        raise HTTPException(status_code=400, detail="Отсутствует дешифрованная полезная нагрузка")
+    session_id = request.state.session_id
+    await log_hub.broadcast(f"Принят зашифрованный POST для сессии {session_id}.")
+    return {
+        "session_id": session_id,
+        "message": "Полезная нагрузка успешно дешифрована middleware.",
+        "received": decrypted,
+    }
+
+
 @app.get("/api/dashboard/state")
 async def dashboard_state() -> dict:
-    sessions = crypto_service.list_sessions()
+    sessions = await session_repository.list_sessions(limit=10)
     return {
         "handshake_requests_total": getattr(app.state, "handshake_requests_total", 0),
         "protected_requests_total": protected_requests_total,
